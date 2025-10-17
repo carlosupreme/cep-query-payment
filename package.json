@@ -1,0 +1,23 @@
+{
+  "name": "cep-query-payment",
+  "version": "1.0.0",
+  "description": "Node.js dependencies for CEP Query Payment - Puppeteer web scraping",
+  "private": true,
+  "scripts": {
+    "postinstall": "echo 'Puppeteer installed successfully'"
+  },
+  "dependencies": {
+    "puppeteer": "^22.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "puppeteer",
+    "web-scraping",
+    "banxico",
+    "cep"
+  ],
+  "author": "Carlos Sosa",
+  "license": "MIT"
+}

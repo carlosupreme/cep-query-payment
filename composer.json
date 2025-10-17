@@ -1,0 +1,65 @@
+{
+    "name": "carlosupreme/cep-query-payment",
+    "description": "Automates the query of the status of a SPEI payment in Banxico using web scraping",
+    "type": "library",
+    "keywords": [
+        "laravel",
+        "banxico",
+        "cep",
+        "spei",
+        "mexico",
+        "payment",
+        "verification",
+        "scraping"
+    ],
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Carlos Sosa",
+            "email": "carlosupremedev@gmai.com"
+        }
+    ],
+    "require": {
+        "php": "^8.2",
+        "illuminate/support": "^11.0",
+        "symfony/process": "^7.0"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^9.0",
+        "pestphp/pest": "^3.0",
+        "pestphp/pest-plugin-laravel": "^3.0",
+        "laravel/pint": "^1.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Carlosupreme\\CEPQueryPayment\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Carlosupreme\\CEPQueryPayment\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Carlosupreme\\CEPQueryPayment\\CEPQueryServiceProvider"
+            ],
+            "aliases": {
+                "CEPQuery": "Carlosupreme\\CEPQueryPayment\\Facades\\CEPQuery"
+            }
+        }
+    },
+    "scripts": {
+        "test": "vendor/bin/pest",
+        "test-coverage": "vendor/bin/pest --coverage",
+        "format": "vendor/bin/pint"
+    },
+    "config": {
+        "allow-plugins": {
+            "pestphp/pest-plugin": true
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
