@@ -22,7 +22,25 @@ $logger = function(string $level, string $message, array $context = []) {
 
 $scriptPath = __DIR__ . '/../resources/js/cep-form-filler.js';
 $cepService = new CEPQueryService($scriptPath, $logger);
+// Determine a sensible working directory so Node can resolve node_modules/puppeteer.
+// Prefer Laravel's base_path() when available, otherwise use the repository root.
+// Try to use Laravel's base_path() when it's available and usable. In a
+// standalone run the helper may exist but the container isn't bootstrapped
+// so calling it will throw; guard with try/catch and fall back to repo root.
+$projectRoot = null;
+if (function_exists('base_path')) {
+    try {
+        $projectRoot = base_path();
+    } catch (Throwable $e) {
+        $projectRoot = null;
+    }
+}
 
+if ($projectRoot === null) {
+    $projectRoot = realpath(__DIR__ . '/..');
+}
+
+$cepService->setWorkingDirectory($projectRoot);
 // Example 1: Get available banks
 echo "=== Example 1: Getting Available Banks ===\n\n";
 try {

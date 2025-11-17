@@ -24,6 +24,9 @@ class CEPQueryService
     /** @var callable|null */
     private $logger;
 
+    /** @var string|null Explicit working directory for Node execution */
+    private ?string $workingDirectory = null;
+
     public function __construct(?string $scriptPath = null, ?callable $logger = null)
     {
         $this->scriptPath = $scriptPath ?? __DIR__.'/../resources/js/cep-form-filler.js';
@@ -603,18 +606,73 @@ SCRIPT;
      */
     private function executeScript(string $scriptPath, ?string $workingDirectory = null): string
     {
-        // Set working directory - use provided or current directory
-        $workingDirectory = $workingDirectory ?? getcwd();
+        // Determine node binary (configurable when running inside Laravel)
+        $nodeBinary = 'node';
+        if (function_exists('config')) {
+            try {
+                $nodeBinary = config('cep-query-payment.node_binary', env('CEP_QUERY_NODE_BINARY', env('NODE_BINARY', 'node')));
+            } catch (\Throwable $e) {
+                $nodeBinary = getenv('CEP_QUERY_NODE_BINARY') ?: getenv('NODE_BINARY') ?: 'node';
+            }
+        } else {
+            $nodeBinary = getenv('CEP_QUERY_NODE_BINARY') ?: getenv('NODE_BINARY') ?: 'node';
+        }
 
-        $process = new Process(['node', $scriptPath], $workingDirectory);
-        $process->setTimeout($this->timeout);
+        // Determine working directory precedence:
+        // 1) method argument, 2) explicitly set on the instance, 3) config('cep-query-payment.node_cwd'), 4) base_path() if available, 5) getcwd()
+        if ($workingDirectory === null && $this->workingDirectory !== null) {
+            $workingDirectory = $this->workingDirectory;
+        }
 
-        // Set environment variables for Node.js
-        $process->setEnv([
-            'NODE_PATH' => $workingDirectory.'/node_modules',
-            'PATH' => getenv('PATH'),
-            'DISPLAY' => ':99', // Use virtual display
+        if ($workingDirectory === null && function_exists('config')) {
+            try {
+                $workingDirectory = config('cep-query-payment.node_cwd', null);
+            } catch (\Throwable $e) {
+                $workingDirectory = getenv('CEP_QUERY_NODE_CWD') ?: null;
+            }
+        }
+
+        if ($workingDirectory === null) {
+            $workingDirectory = getenv('CEP_QUERY_NODE_CWD') ?: null;
+        }
+
+        if ($workingDirectory === null) {
+            // Try base_path() if available
+            if (function_exists('base_path')) {
+                try {
+                    $workingDirectory = base_path();
+                } catch (\Throwable $e) {
+                    $workingDirectory = getcwd();
+                }
+            } else {
+                $workingDirectory = getcwd();
+            }
+        }
+
+        // Determine timeout (seconds)
+        $timeout = $this->timeout;
+        if (function_exists('config')) {
+            try {
+                $timeout = config('cep-query-payment.node_timeout', $this->timeout);
+            } catch (\Throwable $e) {
+                $timeout = (int) (getenv('CEP_QUERY_NODE_TIMEOUT') ?: $this->timeout);
+            }
+        } else {
+            $timeout = (int) (getenv('CEP_QUERY_NODE_TIMEOUT') ?: $this->timeout);
+        }
+
+        // Create and run the process with the selected binary and working directory
+        $process = new Process([$nodeBinary, $scriptPath], $workingDirectory);
+        $process->setTimeout((int) $timeout);
+
+        // Set environment variables for Node.js so it can resolve modules in the target working directory
+        $env = array_merge($_ENV, [
+            'NODE_PATH' => $workingDirectory . '/node_modules',
+            'PATH' => getenv('PATH') ?: (isset($_SERVER['PATH']) ? $_SERVER['PATH'] : ''),
+            'DISPLAY' => ':99', // Use virtual display by default
         ]);
+
+        $process->setEnv($env);
 
         try {
             $process->mustRun();
