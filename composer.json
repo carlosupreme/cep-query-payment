@@ -17,6 +17,10 @@
         {
             "name": "Carlos Sosa",
             "email": "carlosupremedev@gmai.com"
+        },
+        {
+            "name": "Luis Gonzalez",
+            "email": "luis@inquid.dev"
         }
     ],
     "require": {
