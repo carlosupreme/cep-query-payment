@@ -4,18 +4,13 @@ namespace Carlosupreme\CEPQueryPayment;
 
 use DateTime;
 use Exception;
-use Symfony\Component\Process\Exception\ProcessFailedException;
-use Symfony\Component\Process\Process;
+use GuzzleHttp\Client;
+use GuzzleHttp\Cookie\CookieJar;
+use GuzzleHttp\Exception\GuzzleException;
 
-/**
- * CEP Query Service
- *
- * Service class for querying Banco de México Electronic Payment Receipts (CEP)
- * through automated web form filling using Puppeteer/Playwright
- */
 class CEPQueryService
 {
-    private string $scriptPath;
+    private Client $http;
 
     private int $timeout;
 
@@ -24,100 +19,151 @@ class CEPQueryService
     /** @var callable|null */
     private $logger;
 
-    /** @var string|null Explicit working directory for Node execution */
-    private ?string $workingDirectory = null;
+    private string $baseUri = 'https://www.banxico.org.mx';
 
-    public function __construct(?string $scriptPath = null, ?callable $logger = null)
+    public function __construct(?Client $httpClient = null, ?callable $logger = null)
     {
-        $this->scriptPath = $scriptPath ?? __DIR__.'/../resources/js/cep-form-filler.js';
-        $this->timeout = 120; // 120 seconds timeout
+        $this->timeout = 60;
+
         $this->defaultOptions = [
-            'headless' => true, // Production mode - headless
-            'slowMo' => 100, // Normal speed
-            'timeout' => 45000,
+            'timeout' => $this->timeout,
         ];
+
+        $this->http = $httpClient ?? new Client([
+            'base_uri' => $this->baseUri,
+            'timeout'  => $this->timeout,
+            'verify'   => true,
+            'headers'  => [
+                'User-Agent'        => 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
+                'Accept'            => '*/*',
+                'X-Requested-With'  => 'XMLHttpRequest',
+            ],
+        ]);
+
         $this->logger = $logger;
     }
 
     /**
-     * Query CEP using form data
+     * Query CEP using form data via direct POST to Banxico.
      *
-     * @param  array  $formData  Form data for CEP query
-     * @param  array  $options  Additional options for the browser
-     * @return array|null Table data or null if not found
+     * @param  array  $formData
+     * @param  array  $options  (optional timeout override, etc.)
+     * @return array|null
      *
      * @throws Exception
      */
     public function queryPayment(array $formData, array $options = []): ?array
     {
+        $this->validateFormData($formData);
+
+        $timeout = $options['timeout'] ?? $this->timeout;
+
+        $jar = new CookieJar();
+
         try {
-            // Validate required fields
-            $this->validateFormData($formData);
+            // Warm up session (cookies, etc.)
+            $this->http->get('/cep/', [
+                'cookies' => $jar,
+                'timeout' => $timeout,
+            ]);
 
-            // Merge options
-            $browserOptions = array_merge($this->defaultOptions, $options);
+            $payload = [
+                'captcha'             => '',
+                'criterio'            => $formData['criterio'],
+                'cuenta'              => $formData['cuenta'],
+                'emisor'              => $formData['emisor'],
+                'fecha'               => $formData['fecha'],
+                'monto'               => $formData['monto'],
+                'receptor'            => $formData['receptor'],
+                'receptorParticipante'=> 0,
+                'tipoConsulta'        => 0,
+                'tipoCriterio'        => $formData['tipoCriterio'],
+            ];
 
-            // Create the Node.js script content
-            $scriptContent = $this->createExecutionScript($formData, $browserOptions);
+            $this->log('debug', 'Sending CEP request', [
+                'payload' => $this->sanitizeLogData($payload),
+            ]);
 
-            // Write temporary script file
-            $tempScriptPath = $this->createTempScript($scriptContent);
+            $response = $this->http->post('/cep/valida.do', [
+                'cookies'     => $jar,
+                'timeout'     => $timeout,
+                'headers'     => [
+                    'Content-Type'    => 'application/x-www-form-urlencoded; charset=UTF-8',
+                    'Origin'          => $this->baseUri,
+                    'Referer'         => $this->baseUri . '/cep/',
+                    'Sec-Fetch-Site'  => 'same-origin',
+                    'Sec-Fetch-Mode'  => 'cors',
+                    'Sec-Fetch-Dest'  => 'empty',
+                ],
+                'form_params' => $payload,
+            ]);
 
-            try {
-                // Execute the script
-                $result = $this->executeScript($tempScriptPath);
+            $html = (string) $response->getBody();
 
-                // Parse and return result
-                return $this->parseScriptOutput($result);
+            $this->log('debug', 'Raw CEP response (truncated)', [
+                'html' => mb_substr($html, 0, 2000),
+            ]);
 
-            } finally {
-                // Clean up temporary file
-                if (file_exists($tempScriptPath)) {
-                    unlink($tempScriptPath);
-                }
-            }
+            $parsed = $this->parseHtmlResponse($html);
 
-        } catch (Exception $e) {
-            $this->log('error', 'CEP Query failed', [
-                'error' => $e->getMessage(),
+            $this->log('info', 'CEP response parsed', [
+                'has_data'  => $parsed !== null,
+                'data_type' => $parsed['type'] ?? 'null',
+            ]);
+
+            return $parsed;
+        } catch (GuzzleException $e) {
+            $this->log('error', 'CEP HTTP request failed', [
+                'error'    => $e->getMessage(),
                 'formData' => $this->sanitizeLogData($formData),
             ]);
+
+            throw new Exception('CEP HTTP request failed: ' . $e->getMessage(), 0, $e);
+        } catch (Exception $e) {
+            $this->log('error', 'CEP Query failed', [
+                'error'    => $e->getMessage(),
+                'formData' => $this->sanitizeLogData($formData),
+            ]);
+
             throw $e;
         }
     }
 
     /**
-     * Get available bank options
+     * Get available bank options by scraping the CEP page.
      *
-     * @return array Bank codes and names
+     * @return array
      *
      * @throws Exception
      */
     public function getBankOptions(): array
     {
+        $jar = new CookieJar();
+
         try {
-            $scriptContent = $this->createBankOptionsScript();
-            $tempScriptPath = $this->createTempScript($scriptContent);
+            $response = $this->http->get('/cep/', [
+                'cookies' => $jar,
+                'timeout' => $this->timeout,
+                'headers' => [
+                    'Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                ],
+            ]);
 
-            try {
-                $result = $this->executeScript($tempScriptPath);
+            $html = (string) $response->getBody();
 
-                return $this->parseScriptOutput($result) ?? [];
+            $this->log('debug', 'Bank options raw page (truncated)', [
+                'html' => mb_substr($html, 0, 2000),
+            ]);
 
-            } finally {
-                if (file_exists($tempScriptPath)) {
-                    unlink($tempScriptPath);
-                }
-            }
-
-        } catch (Exception $e) {
+            return $this->parseBankOptionsFromHtml($html);
+        } catch (GuzzleException $e) {
             $this->log('error', 'Failed to get bank options', ['error' => $e->getMessage()]);
-            throw $e;
+            throw new Exception('Failed to get bank options: ' . $e->getMessage(), 0, $e);
         }
     }
 
     /**
-     * Validate form data
+     * Validate form data.
      *
      * @throws Exception
      */
@@ -126,17 +172,15 @@ class CEPQueryService
         $required = ['fecha', 'tipoCriterio', 'criterio', 'emisor', 'receptor', 'cuenta', 'monto'];
 
         foreach ($required as $field) {
-            if (! isset($formData[$field]) || empty($formData[$field])) {
+            if (!isset($formData[$field]) || $formData[$field] === '') {
                 throw new Exception("Required field missing: {$field}");
             }
         }
 
-        // Validate tipoCriterio
-        if (! in_array($formData['tipoCriterio'], ['T', 'R'])) {
+        if (!in_array($formData['tipoCriterio'], ['T', 'R'], true)) {
             throw new Exception("Invalid tipoCriterio. Must be 'T' (tracking key) or 'R' (reference number)");
         }
 
-        // Validate criterio length based on type
         if ($formData['tipoCriterio'] === 'R' && strlen($formData['criterio']) > 7) {
             throw new Exception('Reference number cannot exceed 7 characters');
         }
@@ -145,619 +189,167 @@ class CEPQueryService
             throw new Exception('Tracking key cannot exceed 30 characters');
         }
 
-        // Validate and normalize date format (dd-mm-yyyy or dd/mm/yyyy, convert to dd-mm-yyyy)
         if (preg_match('/^\d{2}\/\d{2}\/\d{4}$/', $formData['fecha'])) {
-            // Convert dd/mm/yyyy to dd-mm-yyyy
             $formData['fecha'] = str_replace('/', '-', $formData['fecha']);
-        } elseif (! preg_match('/^\d{2}-\d{2}-\d{4}$/', $formData['fecha'])) {
+        } elseif (!preg_match('/^\d{2}-\d{2}-\d{4}$/', $formData['fecha'])) {
             throw new Exception('Invalid date format. Use dd-mm-yyyy or dd/mm/yyyy');
         }
 
-        // Validate CLABE format (18 digits)
-        if (isset($formData['cuenta']) && strlen($formData['cuenta']) === 18 && ! preg_match('/^\d{18}$/', $formData['cuenta'])) {
+        if (isset($formData['cuenta']) && strlen($formData['cuenta']) === 18 && !preg_match('/^\d{18}$/', $formData['cuenta'])) {
             throw new Exception('Invalid CLABE format. Must be 18 digits');
         }
 
-        // Validate amount format
-        if (! is_numeric(str_replace(',', '', $formData['monto']))) {
+        if (!is_numeric(str_replace(',', '', (string)$formData['monto']))) {
             throw new Exception('Invalid amount format');
         }
 
-        // Validate bank codes (must be numeric)
-        if (! is_numeric($formData['emisor']) || ! is_numeric($formData['receptor'])) {
+        if (!is_numeric($formData['emisor']) || !is_numeric($formData['receptor'])) {
             throw new Exception('Invalid bank codes. Must be numeric');
         }
     }
 
     /**
-     * Create the execution script content
+     * Parse CEP HTML response into a structured array.
      */
-    private function createExecutionScript(array $formData, array $options): string
+    private function parseHtmlResponse(string $html): ?array
     {
-        $formDataJson = json_encode($formData, JSON_UNESCAPED_UNICODE);
-        $optionsJson = json_encode($options, JSON_UNESCAPED_UNICODE);
-
-        return <<<SCRIPT
-const puppeteer = require('puppeteer');
-
-async function queryCEP() {
-    let browser;
-    try {
-        const options = {$optionsJson};
-
-        browser = await puppeteer.launch({
-            headless: options.headless,
-            slowMo: options.slowMo,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--no-first-run',
-                '--no-zygote',
-                '--disable-gpu',
-                '--disable-background-timer-throttling',
-                '--disable-backgrounding-occluded-windows',
-                '--disable-renderer-backgrounding',
-                '--disable-features=TranslateUI',
-                '--disable-web-security',
-                '--disable-features=VizDisplayCompositor',
-                '--disable-extensions',
-                '--disable-plugins',
-                '--disable-default-apps',
-                '--no-default-browser-check',
-                '--disable-popup-blocking',
-                '--window-size=1920,1080'
-            ]
-        });
-
-        const page = await browser.newPage();
-
-        // Set timeout
-        page.setDefaultTimeout(options.timeout);
-
-        // Navigate to CEP page
-        await page.goto('https://www.banxico.org.mx/cep/', {
-            waitUntil: 'networkidle2'
-        });
-
-        // Wait for form to load
-        await page.waitForSelector('#fConsulta', { timeout: 15000 });
-
-        console.log('Form loaded, filling data...');
-
-        // Set viewport for consistent rendering
-        await page.setViewport({ width: 1920, height: 1080 });
-
-        // Fill form fields one by one with delays to allow validation loading
-        console.log('Starting sequential form fill with delays...');
-
-        const formData = {$formDataJson};
-
-        // Helper function to fill input with delay
-        async function fillInput(selector, value, description) {
-            console.log(`Filling \${description}: \${value}`);
-            await page.evaluate((sel, val) => {
-                const element = document.getElementById(sel);
-                if (element) {
-                    element.value = val;
-                    element.dispatchEvent(new Event('input', { bubbles: true }));
-                    element.dispatchEvent(new Event('change', { bubbles: true }));
-                    element.dispatchEvent(new Event('keyup', { bubbles: true }));
-                    element.dispatchEvent(new Event('blur', { bubbles: true }));
-                    console.log('✅ Input filled:', sel, '=', val);
-                } else {
-                    console.log('❌ Input not found:', sel);
-                }
-            }, selector, value);
-            // Wait for validation/loading after each field
-            await new Promise(resolve => setTimeout(resolve, 2500));
+        $html = trim($html);
+        if ($html === '') {
+            return null;
         }
 
-        // Helper function to fill select with delay
-        async function fillSelect(selector, value, description) {
-            console.log(`Filling \${description}: \${value}`);
-            await page.evaluate((sel, val) => {
-                const element = document.getElementById(sel);
-                if (element) {
-                    const option = element.querySelector(`option[value="\${val}"]`);
-                    if (option) {
-                        element.value = val;
-                        element.dispatchEvent(new Event('change', { bubbles: true }));
-                        element.dispatchEvent(new Event('input', { bubbles: true }));
-                        element.dispatchEvent(new Event('focus', { bubbles: true }));
-                        element.dispatchEvent(new Event('blur', { bubbles: true }));
+        libxml_use_internal_errors(true);
+        $dom = new \DOMDocument('1.0', 'UTF-8');
 
-                        // Force redraw
-                        element.style.display = 'none';
-                        element.offsetHeight;
-                        element.style.display = '';
-
-                        console.log('✅ Select updated:', sel, '=', val, '(', option.text, ')');
-                    } else {
-                        console.log('❌ Option not found for value:', val, 'in select:', sel);
-                    }
-                } else {
-                    console.log('❌ Select not found:', sel);
-                }
-            }, selector, value);
-            // Wait for validation/loading after each field
-            await new Promise(resolve => setTimeout(resolve, 2500));
+        if (!$dom->loadHTML($html, LIBXML_NOWARNING | LIBXML_NOERROR)) {
+            $content = trim(strip_tags($html));
+            return $content !== '' ? ['type' => 'text', 'content' => $content] : null;
         }
 
-        // Fill form fields sequentially with delays
-        await fillInput('input_fecha', formData.fecha, 'date field');
-        await fillSelect('input_tipoCriterio', formData.tipoCriterio, 'criteria type');
+        $xpath = new \DOMXPath($dom);
 
-        // Update criteria label after tipoCriterio selection
-        await page.evaluate((formData) => {
-            const criterioLabel = document.querySelector('label[for="input_criterio"]');
-            if (criterioLabel) {
-                criterioLabel.textContent = formData.tipoCriterio === 'T' ? 'Clave de rastreo' : 'Número de referencia';
+        // Specific table with payment info (matches sample HTML)
+        $table = $xpath->query("//div[@id='consultaMISPEI']//table[@id='xxx' or contains(@class,'styled-table')]")->item(0)
+            ?: $xpath->query("//div[@id='consultaMISPEI']//table")->item(0)
+            ?: $xpath->query('//table')->item(0);
+
+        if (!$table instanceof \DOMElement) {
+            $text = trim($xpath->evaluate('string(//div[@id="consultaMISPEI"] | //div[@class="cuerpo-msg"] | //body)'));
+
+            return [
+                'type'    => 'text',
+                'content' => $text !== '' ? $text : trim(strip_tags($html)),
+            ];
+        }
+
+        $rows = [];
+
+        // Each row: <tr><td>Label</td><td>Value</td></tr>
+        $rowNodes = $xpath->query('.//tbody//tr', $table);
+        if (!$rowNodes || $rowNodes->length === 0) {
+            $rowNodes = $xpath->query('.//tr', $table);
+        }
+
+        foreach ($rowNodes as $rowNode) {
+            /** @var \DOMElement $rowNode */
+            $cellNodes = $xpath->query('.//td|.//th', $rowNode);
+            if ($cellNodes->length < 2) {
+                continue;
             }
-        }, formData);
 
-        await fillInput('input_criterio', formData.criterio, 'criteria value');
-        await fillSelect('input_emisor', formData.emisor, 'sender bank');
-        await fillSelect('input_receptor', formData.receptor, 'receiver bank');
-        await fillInput('input_cuenta', formData.cuenta, 'beneficiary account');
-        await fillInput('input_monto', formData.monto, 'amount');
+            $label = trim($cellNodes->item(0)->textContent ?? '');
+            $value = trim($cellNodes->item(1)->textContent ?? '');
 
-        console.log('✅ Sequential form fill with delays completed');
-
-        // Wait for final form processing
-        await new Promise(resolve => setTimeout(resolve, 3000));
-
-        // Verify the form was filled correctly
-        const formValidation = await page.evaluate(() => {
-            const validation = {};
-
-            // Check all critical fields
-            const fields = {
-                'input_fecha': 'fecha',
-                'input_tipoCriterio': 'tipoCriterio',
-                'input_criterio': 'criterio',
-                'input_emisor': 'emisor',
-                'input_receptor': 'receptor',
-                'input_cuenta': 'cuenta',
-                'input_monto': 'monto'
-            };
-
-            Object.keys(fields).forEach(fieldId => {
-                const field = document.getElementById(fieldId);
-                if (field) {
-                    validation[fields[fieldId]] = field.value;
-                    if (field.tagName === 'SELECT') {
-                        const selectedOption = field.options[field.selectedIndex];
-                        validation[fields[fieldId] + '_text'] = selectedOption ? selectedOption.text : 'No selection';
-                    }
-                } else {
-                    validation[fields[fieldId]] = 'FIELD_NOT_FOUND';
-                }
-            });
-
-            console.log('📊 Form validation results:', validation);
-            return validation;
-        });
-
-        console.log('Form validation:', JSON.stringify(formValidation));
-
-        // Enable the submit button by removing disabled class
-        await page.evaluate(() => {
-            const submitButton = document.getElementById('btn_Consultar');
-            if (submitButton) {
-                submitButton.classList.remove('disabled');
-                submitButton.style.cursor = 'pointer';
-                console.log('Submit button enabled');
+            if ($label === '' && $value === '') {
+                continue;
             }
-        });
 
-        // Click submit button
-        const buttonClicked = await page.evaluate(() => {
-            const submitButton = document.getElementById('btn_Consultar');
-            if (submitButton) {
-                console.log('Submit button found. Classes:', submitButton.classList.toString());
-                console.log('Submit button disabled?', submitButton.classList.contains('disabled'));
-
-                if (!submitButton.classList.contains('disabled')) {
-                    console.log('Clicking submit button...');
-                    submitButton.click();
-                    return true;
-                } else {
-                    console.log('Submit button is disabled, cannot click');
-                    return false;
-                }
-            } else {
-                console.log('Submit button not found');
-                return false;
-            }
-        });
-
-        if (!buttonClicked) {
-            throw new Error('Could not click submit button - either not found or disabled');
+            $rows[] = [
+                'label' => $label,
+                'value' => $value,
+            ];
         }
 
-        // Wait for modal to appear with improved detection
-        let result = null;
-        console.log('Waiting for response modal...');
+        if ($rows === []) {
+            $text = trim($xpath->evaluate('string(//div[@id="consultaMISPEI"] | //div[@class="cuerpo-msg"] | //body)'));
 
-        try {
-            // Wait for the modal to appear
-            await page.waitForFunction(() => {
-                const modal = document.getElementById('divValidacionPertenencia');
-                return modal && modal.style.display !== 'none';
-            }, { timeout: 45000 });
-
-            console.log('Modal appeared, waiting for content to load...');
-
-            // Wait for content to fully load
-            await new Promise(resolve => setTimeout(resolve, 5000));
-
-            // Extract all content from the modal
-            result = await page.evaluate(() => {
-                console.log('Starting data extraction...');
-
-                const modal = document.getElementById('divValidacionPertenencia');
-                if (!modal || modal.style.display === 'none') {
-                    console.log('Modal not found or hidden');
-                    return null;
-                }
-
-                const consultaDiv = document.querySelector('#consultaMISPEI');
-                if (!consultaDiv) {
-                    console.log('No consultaMISPEI div found');
-                    return null;
-                }
-
-                console.log('ConsultaMISPEI content:', consultaDiv.innerHTML.substring(0, 200));
-
-                // Look for any table in the modal
-                const tables = consultaDiv.querySelectorAll('table');
-                console.log('Found tables:', tables.length);
-
-                if (tables.length === 0) {
-                    console.log('No tables found');
-                    // Return the text content instead
-                    return {
-                        type: 'text',
-                        content: consultaDiv.textContent.trim(),
-                        html: consultaDiv.innerHTML
-                    };
-                }
-
-                // Process the first table found
-                const table = tables[0];
-                const tableData = {
-                    type: 'table',
-                    headers: [],
-                    rows: []
-                };
-
-                // Extract headers from thead
-                const thead = table.querySelector('thead');
-                if (thead) {
-                    const headerRows = thead.querySelectorAll('tr');
-                    headerRows.forEach(row => {
-                        const headers = Array.from(row.querySelectorAll('th, td'))
-                            .map(cell => cell.textContent.trim())
-                            .filter(text => text.length > 0);
-                        if (headers.length > 0) {
-                            tableData.headers = tableData.headers.concat(headers);
-                        }
-                    });
-                }
-
-                // Extract data rows from tbody
-                const tbody = table.querySelector('tbody');
-                if (tbody) {
-                    const rows = Array.from(tbody.querySelectorAll('tr'));
-                    console.log('Found rows in tbody:', rows.length);
-
-                    tableData.rows = rows.map(row => {
-                        return Array.from(row.querySelectorAll('td, th'))
-                            .map(cell => cell.textContent.trim());
-                    }).filter(row => row.some(cell => cell.length > 0)); // Filter empty rows
-                }
-
-                // If no tbody, check for direct tr elements in table
-                if (tableData.rows.length === 0) {
-                    const directRows = Array.from(table.querySelectorAll('tr'));
-                    console.log('Found direct rows in table:', directRows.length);
-
-                    tableData.rows = directRows.map(row => {
-                        return Array.from(row.querySelectorAll('td, th'))
-                            .map(cell => cell.textContent.trim());
-                    }).filter(row => row.some(cell => cell.length > 0));
-                }
-
-                console.log('Final table data:', tableData);
-                return tableData;
-            });
-
-        } catch (error) {
-            console.log('Error waiting for modal:', error.message);
-
-            // Try to get any content that might be available
-            try {
-                result = await page.evaluate(() => {
-                    const modal = document.getElementById('divValidacionPertenencia');
-                    if (modal) {
-                        return {
-                            type: 'error',
-                            content: modal.textContent.trim(),
-                            html: modal.innerHTML,
-                            display: modal.style.display
-                        };
-                    }
-                    return null;
-                });
-            } catch (e) {
-                console.log('Failed to extract error content:', e.message);
-            }
+            return [
+                'type'    => 'text',
+                'content' => $text !== '' ? $text : trim(strip_tags($html)),
+            ];
         }
 
-        console.log(JSON.stringify({
-            success: true,
-            data: result
-        }));
+        // Summary above the table
+        $summary = trim($xpath->evaluate(
+            'string(//div[@id="consultaMISPEI"]//div[contains(@class,"info")]/center/strong)'
+        ));
 
-    } catch (error) {
-        console.log(JSON.stringify({
-            success: false,
-            error: error.message
-        }));
-    } finally {
-        if (browser) {
-            await browser.close();
-        }
-    }
-}
-
-queryCEP();
-SCRIPT;
+        return [
+            'type'    => 'table',
+            'summary' => $summary !== '' ? $summary : null,
+            'headers' => ['label', 'value'],
+            'rows'    => $rows,
+        ];
     }
 
     /**
-     * Create script to get bank options
+     * Parse bank options from CEP HTML page.
      */
-    private function createBankOptionsScript(): string
+    private function parseBankOptionsFromHtml(string $html): array
     {
-        return <<<'SCRIPT'
-const puppeteer = require('puppeteer');
-
-async function getBankOptions() {
-    let browser;
-    try {
-        browser = await puppeteer.launch({
-            headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage'
-            ]
-        });
-
-        const page = await browser.newPage();
-        await page.goto('https://www.banxico.org.mx/cep/', {
-            waitUntil: 'networkidle2'
-        });
-
-        await page.waitForSelector('#input_emisor');
-
-        const bankOptions = await page.evaluate(() => {
-            const select = document.getElementById('input_emisor');
-            const options = {};
-
-            Array.from(select.options).forEach(option => {
-                if (option.value) {
-                    options[option.value] = option.textContent.trim();
-                }
-            });
-
-            return options;
-        });
-
-        console.log(JSON.stringify({
-            success: true,
-            data: bankOptions
-        }));
-
-    } catch (error) {
-        console.log(JSON.stringify({
-            success: false,
-            error: error.message
-        }));
-    } finally {
-        if (browser) {
-            await browser.close();
+        $html = trim($html);
+        if ($html === '') {
+            return [];
         }
-    }
-}
 
-getBankOptions();
-SCRIPT;
+        libxml_use_internal_errors(true);
+        $dom = new \DOMDocument('1.0', 'UTF-8');
+
+        if (!$dom->loadHTML($html, LIBXML_NOWARNING | LIBXML_NOERROR)) {
+            return [];
+        }
+
+        $xpath = new \DOMXPath($dom);
+        $select = $xpath->query('//select[@id="input_emisor"]')->item(0);
+
+        if (!$select instanceof \DOMElement) {
+            return [];
+        }
+
+        $options = [];
+        foreach ($xpath->query('.//option', $select) as $opt) {
+            /** @var \DOMElement $opt */
+            $value = trim($opt->getAttribute('value'));
+            $label = trim($opt->textContent);
+
+            if ($value !== '') {
+                $options[$value] = $label;
+            }
+        }
+
+        return $options;
     }
 
     /**
-     * Create temporary script file
-     *
-     * @return string Path to temporary file
-     *
-     * @throws Exception
-     */
-    private function createTempScript(string $content): string
-    {
-        $tempDir = sys_get_temp_dir();
-        $tempFile = tempnam($tempDir, 'cep_query_').'.js';
-
-        if (file_put_contents($tempFile, $content) === false) {
-            throw new Exception('Failed to create temporary script file');
-        }
-
-        return $tempFile;
-    }
-
-    /**
-     * Execute the Node.js script
-     *
-     * @return string Script output
-     *
-     * @throws Exception
-     */
-    private function executeScript(string $scriptPath, ?string $workingDirectory = null): string
-    {
-        // Determine node binary (configurable when running inside Laravel)
-        $nodeBinary = 'node';
-        if (function_exists('config')) {
-            try {
-                $nodeBinary = config('cep-query-payment.node_binary', env('CEP_QUERY_NODE_BINARY', env('NODE_BINARY', 'node')));
-            } catch (\Throwable $e) {
-                $nodeBinary = getenv('CEP_QUERY_NODE_BINARY') ?: getenv('NODE_BINARY') ?: 'node';
-            }
-        } else {
-            $nodeBinary = getenv('CEP_QUERY_NODE_BINARY') ?: getenv('NODE_BINARY') ?: 'node';
-        }
-
-        // Determine working directory precedence:
-        // 1) method argument, 2) explicitly set on the instance, 3) config('cep-query-payment.node_cwd'), 4) base_path() if available, 5) getcwd()
-        if ($workingDirectory === null && $this->workingDirectory !== null) {
-            $workingDirectory = $this->workingDirectory;
-        }
-
-        if ($workingDirectory === null && function_exists('config')) {
-            try {
-                $workingDirectory = config('cep-query-payment.node_cwd', null);
-            } catch (\Throwable $e) {
-                $workingDirectory = getenv('CEP_QUERY_NODE_CWD') ?: null;
-            }
-        }
-
-        if ($workingDirectory === null) {
-            $workingDirectory = getenv('CEP_QUERY_NODE_CWD') ?: null;
-        }
-
-        if ($workingDirectory === null) {
-            // Try base_path() if available
-            if (function_exists('base_path')) {
-                try {
-                    $workingDirectory = base_path();
-                } catch (\Throwable $e) {
-                    $workingDirectory = getcwd();
-                }
-            } else {
-                $workingDirectory = getcwd();
-            }
-        }
-
-        // Determine timeout (seconds)
-        $timeout = $this->timeout;
-        if (function_exists('config')) {
-            try {
-                $timeout = config('cep-query-payment.node_timeout', $this->timeout);
-            } catch (\Throwable $e) {
-                $timeout = (int) (getenv('CEP_QUERY_NODE_TIMEOUT') ?: $this->timeout);
-            }
-        } else {
-            $timeout = (int) (getenv('CEP_QUERY_NODE_TIMEOUT') ?: $this->timeout);
-        }
-
-        // Create and run the process with the selected binary and working directory
-        $process = new Process([$nodeBinary, $scriptPath], $workingDirectory);
-        $process->setTimeout((int) $timeout);
-
-        // Set environment variables for Node.js so it can resolve modules in the target working directory
-        $env = array_merge($_ENV, [
-            'NODE_PATH' => $workingDirectory . '/node_modules',
-            'PATH' => getenv('PATH') ?: (isset($_SERVER['PATH']) ? $_SERVER['PATH'] : ''),
-            'DISPLAY' => ':99', // Use virtual display by default
-        ]);
-
-        $process->setEnv($env);
-
-        try {
-            $process->mustRun();
-
-            return $process->getOutput();
-
-        } catch (ProcessFailedException $e) {
-            throw new Exception('Script execution failed: '.$e->getMessage());
-        }
-    }
-
-    /**
-     * Parse script output
-     *
-     * @throws Exception
-     */
-    private function parseScriptOutput(string $output): ?array
-    {
-        $output = trim($output);
-
-        $this->log('debug', 'Raw script output', ['output' => $output]);
-
-        if (empty($output)) {
-            throw new Exception('Script returned empty output');
-        }
-
-        // Try to find JSON in the output (script might have console.log statements)
-        $lines = explode("\n", $output);
-        $jsonLine = null;
-
-        foreach ($lines as $line) {
-            $line = trim($line);
-            if (strpos($line, '{"success"') === 0) {
-                $jsonLine = $line;
-                break;
-            }
-        }
-
-        if (! $jsonLine) {
-            throw new Exception('No valid JSON found in script output: '.substr($output, 0, 500));
-        }
-
-        $result = json_decode($jsonLine, true);
-
-        if (json_last_error() !== JSON_ERROR_NONE) {
-            throw new Exception('Invalid JSON output: '.json_last_error_msg().' | Line: '.$jsonLine);
-        }
-
-        if (! isset($result['success'])) {
-            throw new Exception('Invalid response format. Full output: '.$output);
-        }
-
-        if (! $result['success']) {
-            throw new Exception('Script execution failed: '.($result['error'] ?? 'Unknown error').' | Full output: '.$output);
-        }
-
-        $this->log('info', 'CEP script execution successful', [
-            'has_data' => isset($result['data']) && ! is_null($result['data']),
-            'data_type' => isset($result['data']) ? gettype($result['data']) : 'null',
-        ]);
-
-        return $result['data'] ?? null;
-    }
-
-    /**
-     * Sanitize form data for logging (remove sensitive information)
+     * Sanitize form data for logging (mask sensitive information).
      */
     private function sanitizeLogData(array $formData): array
     {
         $sanitized = $formData;
 
-        // Mask sensitive fields
         if (isset($sanitized['cuenta'])) {
-            $sanitized['cuenta'] = '***'.substr($sanitized['cuenta'], -4);
+            $sanitized['cuenta'] = '***' . substr($sanitized['cuenta'], -4);
         }
 
         if (isset($sanitized['criterio'])) {
-            $sanitized['criterio'] = '***'.substr($sanitized['criterio'], -3);
+            $sanitized['criterio'] = '***' . substr($sanitized['criterio'], -3);
         }
 
         return $sanitized;
     }
 
     /**
-     * Format date for CEP form (dd-mm-yyyy)
+     * Format date for CEP form (dd-mm-yyyy).
      *
      * @param  string|DateTime  $date
      */
@@ -767,23 +359,20 @@ SCRIPT;
             return $date->format('d-m-Y');
         }
 
-        // Try to parse string date
         $dateTime = DateTime::createFromFormat('Y-m-d', $date);
         if ($dateTime) {
             return $dateTime->format('d-m-Y');
         }
 
-        // Convert slashes to dashes if needed
         if (preg_match('/^\d{2}\/\d{2}\/\d{4}$/', $date)) {
             return str_replace('/', '-', $date);
         }
 
-        // Return as-is if already in correct format
         return $date;
     }
 
     /**
-     * Get bank code by name (case-insensitive search)
+     * Get bank code by name (case-insensitive search).
      *
      * @throws Exception
      */
@@ -802,17 +391,7 @@ SCRIPT;
     }
 
     /**
-     * Set the working directory for script execution
-     */
-    public function setWorkingDirectory(string $path): self
-    {
-        $this->workingDirectory = $path;
-
-        return $this;
-    }
-
-    /**
-     * Log a message using the provided logger or do nothing
+     * Log a message using the provided logger or do nothing.
      */
     private function log(string $level, string $message, array $context = []): void
     {
