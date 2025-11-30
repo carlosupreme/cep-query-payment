@@ -14,7 +14,7 @@ This document describes the architecture and design of the CEP Query Service lib
 │                          │ implements                          │
 │                          ▼                                     │
 │  ┌──────────────────────────────────────────────────────────┐  │
-│  │     Carlosupreme\CEPQuery\CEPQueryService                │  │
+│  │     Carlosupreme\CEPQueryPayment\CEPQueryService         │  │
 │  │              (Core Library)                              │  │
 │  │         [Framework-Agnostic]                             │  │
 │  │                                                          │  │
@@ -29,11 +29,7 @@ This document describes the architecture and design of the CEP Query Service lib
 │  │  ┌─────────────────────────────────────────────────┐     │  │
 │  │  │  Private Methods:                               │     │  │
 │  │  │  • validateFormData(array): void                │     │  │
-│  │  │  • createExecutionScript(array, array): string  │     │  │
-│  │  │  • createBankOptionsScript(): string            │     │  │
-│  │  │  • createTempScript(string): string             │     │  │
-│  │  │  • executeScript(string, string): string        │     │  │
-│  │  │  • parseScriptOutput(string): ?array            │     │  │
+│  │  │  • parseHtmlResponse(string): ?array            │     │  │
 │  │  │  • sanitizeLogData(array): array                │     │  │
 │  │  │  • log(string, string, array): void             │     │  │
 │  │  └─────────────────────────────────────────────────┘     │  │
@@ -41,30 +37,16 @@ This document describes the architecture and design of the CEP Query Service lib
 │                          │ uses                                │
 │                          ▼                                     │
 │  ┌──────────────────────────────────────────────────────────┐  │
-│  │         Symfony\Component\Process\Process                │  │
-│  │              (Process Execution                          │  │
+│  │               GuzzleHttp\Client                          │  │
+│  │              (HTTP Requests)                             │  │
 │  └───────────────────────┬──────────────────────────────────┘  │
-│                          │ executes                            │
+│                          │ sends requests                      │
 └──────────────────────────┼─────────────────────────────────────┘
                            ▼
-         ┌─────────────────────────────────────────┐
-         │         Node.js + Puppeteer             │
-         │   (cep-form-filler.js script)           │
-         │                                         │
-         │  ┌───────────────────────────────────┐  │
-         │  │ 1. Launch Headless Chrome         │  │
-         │  │ 2. Navigate to CEP Website        │  │
-         │  │ 3. Fill Form Fields               │  │
-         │  │ 4. Submit Query                   │  │
-         │  │ 5. Extract Table Data             │  │
-         │  │ 6. Return JSON Result             │  │
-         │  └───────────────────────────────────┘  │
-         └──────────────────┬──────────────────────┘
-                            ▼
-              ┌───────────────────────────┐
-              │  Banco de México CEP      │
-              │  https://banxico.org.mx   │
-              └───────────────────────────┘
+             ┌───────────────────────────┐
+             │  Banco de México CEP      │
+             │  https://banxico.org.mx   │
+             └───────────────────────────┘
 ```
 
 ## Data Flow
@@ -80,29 +62,13 @@ User Request
     │       │       │
     │       │       ├─> validateFormData()      [Validate input]
     │       │       │
-    │       │       ├─> createExecutionScript() [Generate JS]
+    │       │       ├─> HTTP GET /cep/          [Warm up session]
     │       │       │
-    │       │       ├─> createTempScript()      [Write to /tmp]
-    │       │       │
-    │       │       ├─> executeScript()         [Run Node.js]
+    │       │       ├─> HTTP POST /cep/valida.do [Submit form]
     │       │       │       │
-    │       │       │       ├─> Puppeteer Launch
-    │       │       │       │       │
-    │       │       │       │       ├─> Navigate to CEP
-    │       │       │       │       │
-    │       │       │       │       ├─> Fill Form
-    │       │       │       │       │
-    │       │       │       │       ├─> Submit
-    │       │       │       │       │
-    │       │       │       │       ├─> Wait for Modal
-    │       │       │       │       │
-    │       │       │       │       ├─> Extract Table
-    │       │       │       │       │
-    │       │       │       │       └─> Return JSON
-    │       │       │       │
-    │       │       │       └─> Process Output
+    │       │       │       └─> Receive HTML response
     │       │       │
-    │       │       ├─> parseScriptOutput()     [Parse JSON]
+    │       │       ├─> parseHtmlResponse()     [Parse HTML to array]
     │       │       │
     │       │       ├─> log()                   [Log result]
     │       │       │
@@ -120,21 +86,11 @@ User Request
     │
     ├─> CEPQueryService::getBankOptions()
     │       │
-    │       ├─> createBankOptionsScript()  [Generate JS]
+    │       ├─> HTTP GET /cep/instituciones.do  [Fetch JSON]
+    │       │       │
+    │       │       └─> Receive JSON response
     │       │
-    │       ├─> createTempScript()         [Write to /tmp]
-    │       │
-    │       ├─> executeScript()            [Run Node.js]
-    │       │       │
-    │       │       ├─> Puppeteer Launch
-    │       │       │
-    │       │       ├─> Navigate to CEP
-    │       │       │
-    │       │       ├─> Extract Select Options
-    │       │       │
-    │       │       └─> Return JSON
-    │       │
-    │       ├─> parseScriptOutput()        [Parse JSON]
+    │       ├─> Parse JSON                      [Extract bank data]
     │       │
     │       └─> return array
     │
@@ -147,24 +103,21 @@ User Request
 ┌─────────────────────────────────────────────────────────┐
 │              CEPQueryService                             │
 ├─────────────────────────────────────────────────────────┤
-│ - scriptPath: string                                     │
+│ - http: Client                                           │
 │ - timeout: int                                           │
 │ - defaultOptions: array                                  │
 │ - logger: ?callable                                      │
+│ - baseUri: string                                        │
+│ - timezone: string                                       │
 ├─────────────────────────────────────────────────────────┤
-│ + __construct(?string, ?callable)                       │
+│ + __construct(?Client, ?callable, string)               │
 │ + queryPayment(array, array): ?array                    │
 │ + getBankOptions(): array                               │
 │ + getBankCodeByName(string): ?string                    │
 │ + static formatDate(DateTime|string): string            │
-│ + setWorkingDirectory(string): self                     │
 ├─────────────────────────────────────────────────────────┤
 │ - validateFormData(array&): void                        │
-│ - createExecutionScript(array, array): string           │
-│ - createBankOptionsScript(): string                     │
-│ - createTempScript(string): string                      │
-│ - executeScript(string, ?string): string                │
-│ - parseScriptOutput(string): ?array                     │
+│ - parseHtmlResponse(string): ?array                     │
 │ - sanitizeLogData(array): array                         │
 │ - log(string, string, array): void                      │
 └─────────────────────────────────────────────────────────┘
@@ -251,16 +204,15 @@ Input Form Data
 │  ├─> Invalid format                                │
 │  └─> Throw Exception with descriptive message      │
 │                                                    │
-│  Layer 2: Script Execution                         │
-│  ├─> Process timeout                               │
-│  ├─> Script not found                              │
-│  └─> Throw ProcessFailedException                  │
+│  Layer 2: HTTP Request                             │
+│  ├─> Connection timeout                            │
+│  ├─> Request failed                                │
+│  └─> Throw GuzzleException                         │
 │                                                    │
-│  Layer 3: Output Parsing                           │
-│  ├─> Empty output                                  │
-│  ├─> Invalid JSON                                  │
-│  ├─> Script execution failure                      │
-│  └─> Throw Exception with output context           │
+│  Layer 3: Response Parsing                         │
+│  ├─> Empty response                                │
+│  ├─> Invalid HTML/JSON                             │
+│  └─> Throw Exception with response context         │
 │                                                    │
 │  Layer 4: Logging                                  │
 │  ├─> Log errors with sanitized data                │
@@ -283,14 +235,14 @@ Sanitization Flow:
   Input → Process → Log (Sanitized) → Output
 ```
 
-### Process Security
+### HTTP Security
 
 ```
-Puppeteer Execution:
-  ├─> Sandboxed browser environment
-  ├─> Temporary script files (auto-cleanup)
-  ├─> No permanent storage of credentials
-  └─> Isolated Node.js process
+Guzzle Configuration:
+  ├─> SSL/TLS verification enabled
+  ├─> User-Agent header for compatibility
+  ├─> Cookie jar for session management
+  └─> No permanent storage of credentials
 ```
 
 ## Performance Characteristics
@@ -301,15 +253,10 @@ Puppeteer Execution:
 Operation                          Time
 ────────────────────────────────────────
 Input Validation                   < 1ms
-Script Generation                  < 5ms
-Script Execution                   30-60s
-  ├─> Browser Launch               5-10s
-  ├─> Page Load                    3-5s
-  ├─> Form Fill                    15-20s
-  ├─> Submit & Wait                10-20s
-  └─> Data Extraction              1-2s
-Output Parsing                     < 10ms
-Total                              ~30-60s
+Session Warm-up (GET /cep/)        1-3s
+Form Submission (POST)             1-3s
+Response Parsing                   < 10ms
+Total                              ~2-6s
 ```
 
 ### Resource Usage
@@ -317,17 +264,15 @@ Total                              ~30-60s
 ```
 Memory:
   - PHP Process: ~10-20 MB
-  - Node.js: ~50-100 MB
-  - Puppeteer: ~100-200 MB
-  Total: ~200-300 MB per query
+  - Guzzle Client: ~5-10 MB
+  Total: ~15-30 MB per query
 
 CPU:
-  - Moderate during browser operation
-  - Light during form filling
+  - Light during HTTP operations
+  - Minimal for HTML parsing
 
 Disk:
-  - Temporary script files (~5-10 KB)
-  - Auto-cleaned after execution
+  - No temporary files required
 ```
 
 ## Extension Points
@@ -343,20 +288,24 @@ $logger = function(string $level, string $message, array $context) {
 $service = new CEPQueryService(null, $logger);
 ```
 
-### Custom Script Path
+### Custom HTTP Client
 
 ```php
-$customScriptPath = '/path/to/custom/scraper.js';
-$service = new CEPQueryService($customScriptPath);
+use GuzzleHttp\Client;
+
+$httpClient = new Client([
+    'timeout' => 120,
+    'verify' => true,
+]);
+
+$service = new CEPQueryService($httpClient);
 ```
 
-### Custom Browser Options
+### Custom Timeout Options
 
 ```php
 $options = [
-    'headless' => false,
-    'slowMo' => 500,
-    'timeout' => 60000,
+    'timeout' => 60,  // 60 second timeout
 ];
 
 $result = $service->queryPayment($formData, $options);
@@ -380,7 +329,7 @@ Tests to Implement:
   │   └─> Test getBankCodeByName()
   │
   └─> Integration Tests
-      ├─> Mock Puppeteer responses
+      ├─> Mock Guzzle responses
       ├─> Test successful queries
       ├─> Test failure scenarios
       └─> Test timeout handling
@@ -394,9 +343,6 @@ php artisan tinker --execute="app(CEPQueryService::class)"
 
 # Run example script
 php ./examples/basic-usage.php
-
-# Test with real data (requires valid credentials)
-# See examples/basic-usage.php
 ```
 
 ## Design Patterns Used
@@ -413,11 +359,14 @@ php ./examples/basic-usage.php
 ```
 CEPQueryService
     │
-    ├─> Symfony\Component\Process\Process
-    │       └─> System Process Execution
+    ├─> GuzzleHttp\Client
+    │       └─> HTTP Request Handling
     │
-    ├─> Node.js + Puppeteer
-    │       └─> Browser Automation
+    ├─> GuzzleHttp\Cookie\CookieJar
+    │       └─> Session Cookie Management
+    │
+    ├─> Carbon\Carbon
+    │       └─> Date/Time Handling
     │
     └─> Optional: PSR-3 Logger Interface
             └─> For logging functionality

@@ -1,17 +1,17 @@
 # CEP Query Service
 
-A PHP library for querying Banco de México's CEP (Comprobantes Electrónicos de Pago / Electronic Payment Receipts) system using web scraping with Puppeteer.
+A PHP library for querying Banco de México's CEP (Comprobantes Electrónicos de Pago / Electronic Payment Receipts) system using Guzzle HTTP client.
 
 ## Overview
 
-This library provides a simple interface to query the SPEI payment system through Banco de México's CEP website. It automates form filling and data extraction using Puppeteer/Playwright for browser automation.
+This library provides a simple interface to query the SPEI payment system through Banco de México's CEP website. It uses Guzzle HTTP client to make direct API requests to the CEP system.
 
 ## Features
 
 - ✅ Query payment status using tracking key or reference number
 - ✅ Retrieve available bank options from CEP system
 - ✅ Automatic form validation and data sanitization
-- ✅ Support for headless and headed browser modes
+- ✅ Lightweight HTTP-based approach (no browser required)
 - ✅ Comprehensive error handling and logging
 - ✅ Framework-agnostic with Laravel integration
 - ✅ Date format normalization
@@ -21,9 +21,7 @@ This library provides a simple interface to query the SPEI payment system throug
 
 - PHP 8.2 or higher
 - Laravel 11.x or 12.x
-- Node.js and npm
-- Puppeteer package (`npm install puppeteer`)
-- Symfony Process component
+- Guzzle HTTP client (installed automatically via composer)
 
 ## Installation
 
@@ -35,19 +33,12 @@ This library provides a simple interface to query the SPEI payment system throug
 composer require carlosupreme/cep-query-payment
 ```
 
-2. Install Node.js dependencies:
+2. The service provider is already registered via Laravel's package auto-discovery.
 
-```bash
-npm install puppeteer
-```
-
-3. The service provider is already registered in `bootstrap/providers.php`.
-
-4. Run:
+3. Run:
 
 ```bash
 composer dump-autoload
-npm install puppeteer
 ```
 
 ## Usage
@@ -55,7 +46,7 @@ npm install puppeteer
 ### Basic Usage (Framework-Agnostic)
 
 ```php
-use Carlosupreme\CEPQuery\CEPQueryService;
+use Carlosupreme\CEPQueryPayment\CEPQueryService;
 
 // Create service instance
 $cepService = new CEPQueryService();
@@ -90,7 +81,7 @@ try {
 ### Laravel Usage
 
 ```php
-use Carlosupreme\CEPQuery\CEPQueryService;
+use Carlosupreme\CEPQueryPayment\CEPQueryService;
 
 class PaymentController extends Controller
 {
@@ -144,7 +135,7 @@ $bankCode = $cepService->getBankCodeByName('BBVA');
 ### Date Formatting
 
 ```php
-use Carlosupreme\CEPQuery\CEPQueryService;
+use Carlosupreme\CEPQueryPayment\CEPQueryService;
 
 // From DateTime object
 $date = new DateTime('2024-01-15');
@@ -163,7 +154,7 @@ $formatted = CEPQueryService::formatDate('15/01/2024');
 ### Custom Logger
 
 ```php
-use Carlosupreme\CEPQuery\CEPQueryService;
+use Carlosupreme\CEPQueryPayment\CEPQueryService;
 
 $logger = function(string $level, string $message, array $context = []) {
     // Custom logging implementation
@@ -173,13 +164,11 @@ $logger = function(string $level, string $message, array $context = []) {
 $cepService = new CEPQueryService(null, $logger);
 ```
 
-### Browser Options
+### Timeout Options
 
 ```php
 $options = [
-    'headless' => false,  // Show browser window
-    'slowMo' => 500,      // Slow down by 500ms
-    'timeout' => 60000,   // 60 second timeout
+    'timeout' => 60,  // 60 second timeout
 ];
 
 $result = $cepService->queryPayment($formData, $options);
@@ -250,7 +239,7 @@ try {
     // Handle errors:
     // - Missing required fields
     // - Invalid data format
-    // - Script execution failures
+    // - HTTP request failures
     // - Timeout errors
     // - Invalid response format
 
@@ -264,27 +253,29 @@ Common exceptions:
 - `Invalid tipoCriterio. Must be 'T' or 'R'`
 - `Invalid date format. Use dd-mm-yyyy or dd/mm/yyyy`
 - `Invalid CLABE format. Must be 18 digits`
-- `Script execution failed`
-- `No valid JSON found in script output`
+- `CEP HTTP request failed: {message}`
 
 ## Configuration
 
-### Script Path
-
-By default, the service looks for the JavaScript file at:
-- Laravel: `resources/js/cep-form-filler.js`
-- Standalone: `{package}/resources/js/cep-form-filler.js`
-
-You can override this:
-
-```php
-$scriptPath = '/custom/path/to/cep-form-filler.js';
-$cepService = new CEPQueryService($scriptPath);
-```
-
 ### Timeout
 
-Default timeout is 120 seconds. The browser operation timeout is 45 seconds.
+Default timeout is 60 seconds.
+
+### Custom HTTP Client
+
+You can provide a custom Guzzle HTTP client:
+
+```php
+use GuzzleHttp\Client;
+use Carlosupreme\CEPQueryPayment\CEPQueryService;
+
+$httpClient = new Client([
+    'timeout' => 120,
+    'verify' => true,
+]);
+
+$cepService = new CEPQueryService($httpClient);
+```
 
 ## Security Considerations
 
@@ -296,19 +287,18 @@ Default timeout is 120 seconds. The browser operation timeout is 45 seconds.
 
 ## Performance Tips
 
-1. **Use Headless Mode**: Set `headless: true` for production (default)
-2. **Cache Bank Options**: Bank codes rarely change, cache them
-3. **Adjust Timeouts**: Reduce for faster failures, increase for slow networks
-4. **Queue Jobs**: For Laravel, use queues for CEP queries
-5. **Error Monitoring**: Log failures for debugging
+1. **Cache Bank Options**: Bank codes rarely change, cache them
+2. **Adjust Timeouts**: Reduce for faster failures, increase for slow networks
+3. **Queue Jobs**: For Laravel, use queues for CEP queries
+4. **Error Monitoring**: Log failures for debugging
 
 ## Troubleshooting
 
-### Script Fails to Execute
+### HTTP Request Fails
 
-- Ensure Node.js is installed: `node --version`
-- Verify Puppeteer is installed: `npm list puppeteer`
-- Check file permissions on script
+- Check network connectivity
+- Verify CEP website is accessible
+- Consider server location (latency)
 - Review logs for detailed error messages
 
 ### Timeout Errors
@@ -316,13 +306,10 @@ Default timeout is 120 seconds. The browser operation timeout is 45 seconds.
 - Increase timeout in options
 - Check network connectivity
 - Verify CEP website is accessible
-- Consider server location (latency)
 
 ### Invalid Response
 
 - CEP website may have changed structure
-- Check browser console logs
-- Try non-headless mode for debugging
 - Verify form data is correct
 
 ### No Results Found
@@ -343,14 +330,6 @@ composer install --dev
 
 # Run tests
 ./vendor/bin/pest
-```
-
-### Debug Mode
-
-```php
-// Run with visible browser
-$options = ['headless' => false, 'slowMo' => 1000];
-$result = $cepService->queryPayment($formData, $options);
 ```
 
 ## License

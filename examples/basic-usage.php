@@ -70,13 +70,11 @@ try {
             'monto'        => $formData['monto'],
         ], JSON_PRETTY_PRINT) . "\n\n";
 
-    echo "Executing query (this may take 30-60 seconds)...\n";
+    echo "Executing query...\n";
 
     // Custom options for this query
     $options = [
-        'headless' => true,   // Run in headless mode
-        'slowMo'   => 100,      // Slow down by 100ms
-        'timeout'  => 45000,   // 45 second timeout
+        'timeout'  => 60,   // 60 second timeout
     ];
 
     $result = $cepService->queryPayment($formData, $options);
