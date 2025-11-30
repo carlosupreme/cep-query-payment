@@ -74,7 +74,7 @@ try {
 
     // Custom options for this query
     $options = [
-        'timeout'  => 45,   // 45 second timeout
+        'timeout'  => 60,   // 60 second timeout
     ];
 
     $result = $cepService->queryPayment($formData, $options);
